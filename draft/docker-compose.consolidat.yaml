@@ -1,0 +1,559 @@
+# =============================================================================
+# Akadion — compose consolidat (DRAFT, nevalidat cu docker)
+#
+# Sursa: infra/docker-compose.yaml (Keycloak, postgres, MinIO, backend, frontend)
+#      + ../orchestration/docker-compose.yaml (qdrant, embedder, reranker,
+#        llm-response, jaeger)
+#
+# Nu am rulat `docker compose config` — nu exista Docker in container.
+# Validarea se face pe host.
+#
+# -----------------------------------------------------------------------------
+# DECIZIE: o singura retea, cea implicita a proiectului (`default`).
+#   Am eliminat complet `akadion_shared` (external) si `rag_network`. Motivul
+#   pentru care existau: doua proiecte compose separate = doua retele separate,
+#   iar puntea dintre ele trebuia creata manual
+#   (`docker network create akadion_shared`). Cu un singur fisier, toate
+#   containerele sunt deja in aceeasi retea, deci puntea nu mai are rost.
+#   Consecinta directa: dispare si pasul manual de creare a retelei din
+#   README-ul orchestrarii.
+#
+# DECIZIE: adresele intre servicii sunt scrise cu NUMELE DE SERVICIU
+#   (minio:9000, backend:8081, jaeger:4318), nu cu container_name
+#   (akadion-minio, akadion-backend, akadion-jaeger) cum erau in orchestrare.
+#   Ambele forme se rezolva prin DNS-ul intern al retelei, dar numele de
+#   serviciu e forma canonica in compose si supravietuieste unei redenumiri de
+#   container. Am pastrat totusi `container_name:` peste tot, ca `docker logs
+#   akadion-embedder` sa functioneze la fel ca inainte.
+#
+# DECIZIE: cai de build relative la ACEST fisier (draft/).
+#   Deci `../infra/...` pentru backend/frontend si `../../orchestration/...`
+#   pentru serviciile RAG. Daca muti fisierul in infra/ sau in radacina
+#   repo-ului, TOATE `context:`-urile de mai jos trebuie rescrise. Contextele
+#   RAG ies din repo-ul akadion-deploy — legal pentru docker, dar inseamna ca
+#   fisierul asta nu e portabil singur.
+#
+# -----------------------------------------------------------------------------
+# SYMLINK-URI RUPTE in infra/ — nu le-am reparat, doar le documentez.
+#
+#   infra/backend  -> ../services/akadion-backend/akadion   (RUPT)
+#   infra/frontend -> ../services/FRONTEND---Akadion        (RUPT)
+#
+#   De ce sunt rupte: tinta e relativa la infra/, deci se rezolva la
+#   akadion-deploy/services/... — director care nu exista. Clonele reale sunt
+#   cu un nivel mai sus, in /IdeaProjects/akadion-pycharm/services/.
+#   Acelasi symlink din ../infra/ (copia din afara repo-ului) se rezolva corect,
+#   fiindca acolo e la adancimea potrivita. Symlink-urile au fost copiate
+#   textual intr-un repo mai adanc, fara rescrierea caii.
+#
+#   Cum ar trebui inlocuite (o singura varianta, la alegere, pe host):
+#     a) rescrie tinta cu inca un nivel de ../ :
+#          ln -sfn ../../services/akadion-backend/akadion infra/backend
+#          ln -sfn ../../services/FRONTEND---Akadion      infra/frontend
+#        Cel mai mic efort, dar repo-ul ramane nefunctional pe alta masina.
+#     b) scoate symlink-urile din repo si pune caile absolute/relative direct in
+#        `context:` (varianta din draftul asta e echivalenta cu (a)).
+#     c) varianta curata pe termen lung: git submodule sau clonare explicita a
+#        celor doua repo-uri, ca la orchestration/ unde symlink-urile embedder /
+#        reranker / llm-response sunt corecte si tin.
+#
+#   Pana atunci `docker compose build backend frontend` va esua cu
+#   "context not found" — restul stivei se ridica normal.
+#
+# -----------------------------------------------------------------------------
+# DECIZIE: nicio coliziune reala de rezolvat, ceea ce simplifica mult
+#   consolidarea. Verificat explicit:
+#     - container_name: cele 11 sunt distincte (toate prefixate akadion-).
+#     - porturi host: infra ocupa 5432, 8080, 8081, 5173, 9000, 9001;
+#       orchestrarea ocupa 6333, 8000, 8001, 8002, 4318, 16686. Disjuncte.
+#       Le-am pastrat pe toate, neschimbate.
+#     - volume: postgres_data, minio_data, qdrant_data, hf_cache — distincte.
+#   Singurul conflict latent e in afara acestor doua fisiere:
+#   work/reranker-service/compose.yaml foloseste `container_name: reranker`.
+#   Daca cineva porneste si acel compose in paralel, numele nu se bat cap in cap
+#   cu akadion-reranker, dar cele doua containere vor concura pe portul 8002.
+#
+# DECIZIE: `restart: unless-stopped` uniform.
+#   In infra era peste tot, in orchestrare nicaieri. Am aliniat la varianta
+#   infra. Exceptie: minio-setup, care e one-shot si trebuie sa iasa cu 0 si sa
+#   ramana iesit (`restart: "no"`, explicit).
+#
+# DECIZIE: healthcheck-uri active doar unde stiu sigur ce unelte exista in
+#   imagine. Imaginile python:3.x-slim n-au curl/wget, dar au python — deci sondez
+#   cu urllib. Pentru postgres exista pg_isready. Pentru minio, keycloak, qdrant
+#   si backend am lasat healthcheck-ul propus dar COMENTAT, cu # DE VERIFICAT,
+#   fiindca nu pot confirma din container ce binare contin imaginile alea; un
+#   healthcheck care nu poate rula lasa serviciul `unhealthy` la infinit si
+#   blocheaza tot ce depinde de el.
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------- date ----
+  postgres:
+    image: postgres:16
+    container_name: akadion-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: akadion
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-secret}
+      TZ: Europe/Bucharest
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # DECIZIE: singurul healthcheck pe care il activez fara rezerve —
+    # pg_isready e livrat in imaginea oficiala postgres. Il folosesc ca sa pot
+    # inlocui `depends_on: [postgres]` (care doar asteapta pornirea procesului)
+    # cu `condition: service_healthy` la keycloak si backend. Ambele deschid
+    # conexiune JDBC imediat la start si crapa daca baza inca nu accepta.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U myuser -d akadion"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  minio:
+    image: minio/minio:RELEASE.2025-06-13T11-33-47Z
+    container_name: akadion-minio
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-MinioParola123!}
+      TZ: Europe/Bucharest
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    # DE VERIFICAT: are imaginea asta pinnata `curl` inauntru? Versiunile
+    # recente MinIO au scos utilitarele din imagine, iar endpoint-ul
+    # /minio/health/live nu se poate sonda fara client HTTP. Daca `docker exec
+    # akadion-minio curl --version` raspunde, decomenteaza; daca nu, alternativa
+    # e `mc ready local` (doar in imaginile care includ mc) sau lasi fara.
+    # Lasat comentat intentionat: un healthcheck care esueaza mereu ar bloca
+    # minio-setup si backend-ul in asteptare.
+    # healthcheck:
+    #   test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+    #   interval: 10s
+    #   timeout: 5s
+    #   retries: 5
+    #   start_period: 20s
+
+  # Creeaza bucket-ul o singura data si iese. `docker compose ps` il va arata
+  # Exited (0) — e normal, nu e un serviciu care ramane pornit.
+  minio-setup:
+    image: minio/mc:latest
+    container_name: akadion-minio-setup
+    # DECIZIE: `restart: "no"` explicit. In infra nu avea deloc politica de
+    # restart si mostenea implicitul (tot "no"), dar acum ca restul stivei e
+    # `unless-stopped` merita scris, ca sa nu-l "alinieze" cineva din reflex si
+    # sa intre in bucla de repornire dupa fiecare Exited (0).
+    restart: "no"
+    depends_on:
+      # DECIZIE: raman pe `depends_on` simplu (service_started), nu
+      # service_healthy. Entrypoint-ul are deja bucla lui `until mc alias set`,
+      # deci isi face singur asteptarea; iar healthcheck-ul de minio e comentat
+      # mai sus, deci service_healthy n-ar avea pe ce sa se sprijine.
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc alias set myminio http://minio:9000 $${MINIO_ROOT_USER:-minioadmin} $${MINIO_ROOT_PASSWORD:-MinioParola123!}) do echo '...astept minio...' && sleep 1; done;
+      /usr/bin/mc mb myminio/course-documents --ignore-existing;
+      "
+    # DECIZIE: pastrez `$${...}` cu doua dolari. Nu e greseala de copiere:
+    # compose interpoleaza $VAR inainte sa trimita comanda in container, iar
+    # $$ e escape-ul care lasa variabila sa ajunga la shell-ul din container,
+    # unde e citita din environment-ul containerului. Le-am mutat 1:1.
+    # DE VERIFICAT: containerul asta NU primeste `environment:`, deci
+    # MINIO_ROOT_USER / MINIO_ROOT_PASSWORD nu exista in el si bucla cade mereu
+    # pe default-urile din `:-`. Merge cat timp nu schimbi parola in .env;
+    # daca o schimbi, `mc alias set` va folosi minioadmin si va esua. Era la fel
+    # si in infra/docker-compose.yaml — n-am "reparat" tacut, doar semnalez.
+    # Fixul ar fi un bloc environment: cu cele doua variabile.
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: akadion-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      # DE VERIFICAT: README-ul orchestrarii listeaza qdrant pe "6333 / 6334"
+      # (6334 = gRPC), dar compose-ul publica doar 6333. N-am adaugat 6334 de la
+      # mine — daca ceva vorbeste gRPC cu Qdrant, trebuie publicat si el.
+    environment:
+      QDRANT__LOG_LEVEL: WARN
+      TZ: Europe/Bucharest
+    volumes:
+      - qdrant_data:/qdrant/storage
+    # DE VERIFICAT: imaginea qdrant e minimala si probabil n-are nici curl nici
+    # wget, deci nu pot sonda /healthz din interior. Verifica pe host cu
+    # `docker exec akadion-qdrant sh -c 'command -v curl wget'`. Daca nu exista
+    # niciunul, ramane fara healthcheck si embedder-ul depinde de el doar prin
+    # service_started (vezi mai jos).
+    # healthcheck:
+    #   test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+    #   interval: 10s
+    #   timeout: 5s
+    #   retries: 5
+
+  # ------------------------------------------------------------- identitate --
+  keycloak:
+    image: quay.io/keycloak/keycloak:latest
+    container_name: akadion-keycloak
+    restart: unless-stopped
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/akadion
+      KC_DB_USERNAME: myuser
+      KC_DB_PASSWORD: ${DB_PASSWORD:-secret}
+      TZ: Europe/Bucharest
+    command: start-dev --import-realm --hostname=http://keycloak:8080 --hostname-strict=false
+    ports:
+      - "8080:8080"
+    volumes:
+      # Realm-ul Akadion + utilizatorii lui. Importul se face doar la prima
+      # pornire, cat timp baza e goala; dupa aceea fisierele sunt ignorate.
+      - ../infra/keycloak-import:/opt/keycloak/data/import
+      - ../infra/keycloak-theme/university-theme:/opt/keycloak/themes/university-theme
+    depends_on:
+      # DECIZIE: am inlocuit `- postgres` cu service_healthy. Keycloak ruleaza
+      # migrarile de schema la pornire si pica daca postgres inca initializeaza
+      # clusterul (primul start, cand volumul e gol). Inainte scapa doar din
+      # noroc, pe intarzierea de pornire a JVM-ului.
+      postgres:
+        condition: service_healthy
+    # DE VERIFICAT: imaginea Keycloak e pe UBI-micro, fara curl si fara wget.
+    # Varianta care merge de obicei e trucul bash /dev/tcp (bash exista in
+    # imagine). Verifica pe host inainte de a decomenta:
+    #   docker exec akadion-keycloak bash -c 'exec 3<>/dev/tcp/localhost/8080'
+    # healthcheck:
+    #   test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 || exit 1"]
+    #   interval: 15s
+    #   timeout: 5s
+    #   retries: 10
+    #   start_period: 60s
+
+  # ------------------------------------------------------------ aplicatie ----
+  backend:
+    build:
+      # DE VERIFICAT: symlink rupt, vezi blocul SYMLINK-URI din antetul
+      # fisierului. Calea de mai jos merge doar dupa ce infra/backend e refacut.
+      # Alternativa directa, care sare peste symlink:
+      #   context: ../../services/akadion-backend/akadion
+      context: ../infra/backend
+      dockerfile: Dockerfile
+    container_name: akadion-backend
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      # Doua URL-uri diferite pentru Keycloak, intentionat: browserul il vede
+      # pe localhost:8080, backend-ul din container il vede pe keycloak:8080.
+      APP_KEYCLOAK_BASE_URL: http://keycloak:8080
+      # DE VERIFICAT: comentariul de mai sus (mutat 1:1 din infra) spune
+      # "browserul il vede pe localhost:8080", dar valoarea e tot
+      # http://keycloak:8080 — nume care nu se rezolva din browserul de pe host.
+      # Contradictie existenta in original, n-o rezolv de capul meu. Daca
+      # redirectul de login pica in browser, asta e prima suspecta:
+      # probabil ar trebui http://localhost:8080. Acelasi semn de intrebare si
+      # pentru `--hostname=http://keycloak:8080` din command-ul keycloak.
+      APP_KEYCLOAK_BROWSER_BASE_URL: http://keycloak:8080
+      APP_KEYCLOAK_REALM: Akadion
+      KEYCLOAK_AUTHORIZATION_URI: http://keycloak:8080/realms/Akadion/protocol/openid-connect/auth
+      KEYCLOAK_TOKEN_URI: http://keycloak:8080/realms/Akadion/protocol/openid-connect/token
+      KEYCLOAK_JWK_SET_URI: http://keycloak:8080/realms/Akadion/protocol/openid-connect/certs
+      KEYCLOAK_USER_INFO_URI: http://keycloak:8080/realms/Akadion/protocol/openid-connect/userinfo
+      KEYCLOAK_ISSUER_URI: http://keycloak:8080/realms/Akadion
+      KEYCLOAK_BACKEND_LOGIN_SECRET: ${KEYCLOAK_BACKEND_LOGIN_SECRET:-CXjLqtrWOxFIqujnPSHXmr8BssiFBqNH5L5t4UPUoT3b6mnli3hzH3E7HWo5AF8UJyKGf7ULfEGzbzdpd3eP5A}
+      KEYCLOAK_ADMIN_API_SECRET: ${KEYCLOAK_ADMIN_API_SECRET:-qkFpqAaDSjl4E9jcHgBe6kFJw0yRwpxWVs6waB1pitVQOboDQodvmbLbnt2pItjxHBeBwbVcVUddreumBT7BHf}
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/akadion
+      DB_PASSWORD: ${DB_PASSWORD:-secret}
+      APP_FRONTEND_BASE_URL: http://localhost:5173
+      MINIO_URL: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-MinioParola123!}
+      # DECIZIE: URL-urile RAG trec de la container_name la nume de serviciu
+      # (era http://akadion-llm-response:8000 / http://akadion-embedder:8001,
+      # forma impusa de faptul ca serviciile stateau in alt proiect compose si
+      # se vedeau doar prin akadion_shared). Acum sunt vecini in acelasi fisier.
+      RAG_BASE_URL: ${RAG_BASE_URL:-http://llm-response:8000}
+      RAG_EMBEDDER_URL: ${RAG_EMBEDDER_URL:-http://embedder:8001}
+      RAG_SERVICE_USERNAME: ${RAG_SERVICE_USERNAME:-akadion-spring-backend}
+      RAG_SERVICE_PASSWORD: ${RAG_SERVICE_PASSWORD:-parola_spring_rag}
+      TZ: Europe/Bucharest
+      OTEL_SERVICE_NAME: akadion-backend
+      # Idem: era http://akadion-jaeger:4318, acum numele de serviciu.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
+      OTEL_INSTRUMENTATION_LOGBACK_MDC_ENABLED: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # DECIZIE: keycloak si minio raman service_started, nu service_healthy —
+      # healthcheck-urile lor sunt comentate mai sus (nu stiu ce unelte au
+      # imaginile). Cand le confirmi, treci-le pe service_healthy: backend-ul
+      # citeste JWKS-ul de la Keycloak la pornire.
+      # (forma lunga, cu `condition:`, si pentru astea doua: compose nu accepta
+      # amestec de lista si mapare in acelasi `depends_on`.)
+      keycloak:
+        condition: service_started
+      minio:
+        condition: service_started
+      # DECIZIE: NU am adaugat depends_on catre embedder / llm-response, desi
+      # acum ar fi posibil (inainte erau in alt compose, deci nici nu se putea).
+      # Backend-ul apeleaza RAG-ul lenes, per request, nu la pornire; o
+      # dependenta l-ar tine blocat cateva minute in spatele incarcarii
+      # modelului BGE-m3 din embedder, fara sa castige nimic.
+    # DE VERIFICAT: pom.xml are spring-boot-starter-actuator, deci /actuator/health
+    # exista, dar (a) imaginea eclipse-temurin:21-jre n-are curl/wget si
+    # (b) nu e clar daca Spring Security lasa endpoint-ul liber. Verifica pe host:
+    #   curl -i http://localhost:8081/actuator/health
+    # Daca raspunde 200 fara autentificare, un healthcheck merita — dar are
+    # nevoie de un client HTTP adaugat in Dockerfile-ul backend-ului.
+
+  frontend:
+    build:
+      # DE VERIFICAT: acelasi symlink rupt. Alternativa fara symlink:
+      #   context: ../../services/FRONTEND---Akadion
+      context: ../infra/frontend
+      dockerfile: Dockerfile
+    container_name: akadion-frontend
+    restart: unless-stopped
+    ports:
+      # nginx asculta pe 80 in container; nginx.conf face proxy la backend:8081
+      - "5173:80"
+    depends_on:
+      # DECIZIE: ramane service_started (nu healthy). nginx.conf are
+      # `proxy_pass http://backend:8081` cu hostname literal, iar nginx rezolva
+      # upstream-ul la pornire si refuza sa porneasca daca numele nu se rezolva
+      # deloc. service_started garanteaza ca exista containerul, deci si
+      # inregistrarea DNS — suficient. A astepta backend-ul complet pornit ar
+      # intarzia degeaba pagina de login.
+      - backend
+    # DECIZIE: numele serviciului ramane obligatoriu `backend`. nginx.conf din
+    # repo-ul de frontend e hardcodat pe `backend:8081`; o redenumire aici ar
+    # rupe proxy-ul fara niciun mesaj de eroare la build.
+
+  # ------------------------------------------------------------------ RAG ----
+  embedder:
+    build:
+      context: ../../orchestration/embedder
+      dockerfile: Dockerfile.multistage
+    container_name: akadion-embedder
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      # Era akadion-minio:9000 (container_name), fiindca MinIO statea in
+      # celalalt compose si se vedea doar prin akadion_shared. Acum, nume de
+      # serviciu. Atentie: fara schema http:// — asa il vrea clientul MinIO.
+      MINIO_ENDPOINT: minio:9000
+      # DECIZIE: acelasi cont MinIO, doua perechi de nume de variabile.
+      # infra il declara ca MINIO_ROOT_USER / MINIO_ROOT_PASSWORD (numele cerute
+      # de server), embedder-ul il citeste ca MINIO_ACCESS_KEY / MINIO_SECRET_KEY
+      # (numele cerute de client). Cu doua .env-uri separate mergeau in paralel;
+      # cu unul singur ar fi fost usor sa le desincronizezi. Am ales sa existe o
+      # singura sursa de adevar in .env — MINIO_ROOT_USER / MINIO_ROOT_PASSWORD —
+      # si sa o mapez aici pe numele asteptate de aplicatie. Default-urile erau
+      # oricum identice in ambele fisiere (minioadmin / MinioParola123!).
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-MinioParola123!}
+      MINIO_BUCKET: course-documents
+      RAG_SERVICE_USERNAME: ${RAG_SERVICE_USERNAME:-akadion-spring-backend}
+      RAG_SERVICE_PASSWORD: ${RAG_SERVICE_PASSWORD:-parola_spring_rag}
+      TZ: Europe/Bucharest
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      GEMINI_VISION_MODEL: ${GEMINI_VISION_MODEL:-gemini-3.1-flash-lite}
+      GEMINI_REQUEST_DELAY_SECONDS: ${GEMINI_REQUEST_DELAY_SECONDS:-13.0}
+      MIN_IMAGE_WIDTH: ${MIN_IMAGE_WIDTH:-100}
+      MIN_IMAGE_HEIGHT: ${MIN_IMAGE_HEIGHT:-100}
+      MAX_IMAGES_PER_DOCUMENT: ${MAX_IMAGES_PER_DOCUMENT:-20}
+      # Callback-ul async de status imagini, spre backend-ul Spring (PATCH).
+      # Era http://akadion-backend:8081/... — acum nume de serviciu.
+      SPRING_BOOT_CALLBACK_URL: ${SPRING_BOOT_CALLBACK_URL:-http://backend:8081/api/rag/documents/image-status}
+      SPRING_BOOT_CALLBACK_USERNAME: ${SPRING_BOOT_CALLBACK_USERNAME:-akadion-embedder-callback}
+      SPRING_BOOT_CALLBACK_PASSWORD: ${SPRING_BOOT_CALLBACK_PASSWORD:-parola_callback_imagini}
+      OTEL_SERVICE_NAME: embedder
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
+    volumes:
+      # Modelul BGE-m3 (2.3 GB) descarcat o singura data, nu la fiecare pornire
+      - hf_cache:/root/.cache/huggingface
+    depends_on:
+      # DECIZIE: service_started, nu service_healthy — healthcheck-ul qdrant e
+      # comentat (vezi mai sus). Cand il confirmi, treci aici pe service_healthy.
+      - qdrant
+    # DECIZIE: sondez cu python, nu cu curl. Imaginea e python:3.12.13-slim,
+    # care n-are curl/wget, dar are interpretorul in PATH (venv-ul e pus in PATH
+    # de Dockerfile). Verific si CONTINUTUL raspunsului, nu doar codul 200:
+    # /api/health raspunde 200 si cand e "degraded" (model neincarcat sau Qdrant
+    # picat), iar un 200 pe "degraded" ar declara serviciul gata prea devreme.
+    # Consecinta: embedder-ul devine healthy doar cu Qdrant accesibil.
+    # start_period generos — primul start descarca ~2.3 GB de model.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request,sys; sys.exit(0 if json.load(urllib.request.urlopen('http://localhost:8001/api/health'))['status']=='ok' else 1)"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 300s
+
+  reranker:
+    build:
+      context: ../../orchestration/reranker
+      # Dockerfile-urile s-au mutat în docker/ (repo-ul reranker-service)
+      dockerfile: docker/Dockerfile.multistage
+    container_name: akadion-reranker
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    # Fara HF_HOME aici: modelul e copt in imagine la /opt/hf,
+    # iar o valoare in compose ar suprascrie ENV-ul din Dockerfile.
+    # DECIZIE: din acelasi motiv NU i-am dat volumul hf_cache, desi embedder-ul
+    # are unul si compose.yaml-ul propriu al reranker-ului monta hf-cache.
+    # Imaginea ruleaza cu HF_HUB_OFFLINE=1 si modelul deja copiat — un volum
+    # peste /root/.cache/huggingface n-ar fi folosit la nimic.
+    environment:
+      # Basic auth pe /api/rerank/chunks: fara ele, verify_credentials
+      # intoarce 500, iar llm-response cade tacut pe raspuns fara reranking.
+      RAG_SERVICE_USERNAME: ${RAG_SERVICE_USERNAME:-akadion-spring-backend}
+      RAG_SERVICE_PASSWORD: ${RAG_SERVICE_PASSWORD:-parola_spring_rag}
+      LOG_FORMAT: json
+      SERVICE_NAME: reranker
+      TZ: Europe/Bucharest
+      OTEL_SERVICE_NAME: reranker
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
+    # /api/health e lasat deliberat in afara basic auth (exista test in
+    # tests/test_auth.py care fixeaza asta), deci sonda nu trimite credentiale.
+    # Aici e destul codul 200 — endpoint-ul nu are stare "degraded".
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8002/api/health').status==200 else 1)"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  llm-response:
+    build:
+      context: ../../orchestration/llm-response
+      # Idem reranker: reorganizarea de layout a mutat Dockerfile-urile în docker/
+      dockerfile: docker/Dockerfile.multistage
+    container_name: akadion-llm-response
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    # DECIZIE: am scos `env_file: ./llm-response/.env`.
+    # Orchestrarea avea DOUA fisiere .env cu acelasi continut, unul la radacina
+    # (pentru interpolare ${...}) si unul in llm-response/ (citit doar de acest
+    # serviciu) — sursa de erori: completai cheia Gemini intr-unul si uitai in
+    # celalalt. Consolidarea are un singur .env, deci trec explicit variabilele
+    # de mai jos. Le-am obtinut citind ce citeste efectiv codul din
+    # RAG_llm_response_service_Stefi (os.getenv): GEMINI_API_KEY, GEMINI_MODEL,
+    # QDRANT_COLLECTION, USE_QDRANT_MOCK, QDRANT_HOST/PORT, EMBEDDER_URL,
+    # RERANKER_URL, LOG_FORMAT, LOG_LEVEL, RAG_SERVICE_*, SERVICE_NAME.
+    # DE VERIFICAT: daca in llm-response/.env de pe host mai are ceva pus de mana
+    # si necitit prin os.getenv (de ex. citit de o librarie), se pierde aici.
+    # Compara inainte de a sterge fisierul: `cat orchestration/llm-response/.env`.
+    environment:
+      # Numele serviciilor tin loc de hostname (in .env-ul de dezvoltare erau
+      # localhost — de aceea trebuie suprascrise aici).
+      RERANKER_URL: http://reranker:8002/api/rerank/chunks
+      EMBEDDER_URL: http://embedder:8001/api/query/embed
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: "6333"
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-course_chunks}
+      # DECIZIE: pastrez "false" hardcodat, ca in orchestrare, unde suprascria
+      # intentionat valoarea din .env. Mock-ul Qdrant ocoleste baza vectoriala
+      # reala; intr-o stiva pornita integral n-are ce cauta. Daca chiar il vrei
+      # comutabil, inlocuieste cu ${USE_QDRANT_MOCK:-false}.
+      USE_QDRANT_MOCK: "false"
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.1-flash-lite}
+      RAG_SERVICE_USERNAME: ${RAG_SERVICE_USERNAME:-akadion-spring-backend}
+      RAG_SERVICE_PASSWORD: ${RAG_SERVICE_PASSWORD:-parola_spring_rag}
+      LOG_FORMAT: json
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SERVICE_NAME: llm-response
+      TZ: Europe/Bucharest
+      OTEL_SERVICE_NAME: llm-response
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
+    depends_on:
+      # DECIZIE: aici trec pe service_healthy, spre deosebire de restul.
+      # Motiv: nimic nu asteapta llm-response la pornire (backend-ul il apeleaza
+      # lenes), deci intarzierea lui nu blocheaza stiva; in schimb castig
+      # garantia ca, atunci cand apare `healthy`, lantul embedder -> reranker e
+      # deja functional si prima intrebare nu pica pe un reranker neincarcat.
+      # Costul: `docker compose up` sta cateva minute pe embedder la primul
+      # start (descarcare BGE-m3). Daca deranjeaza, coboara la service_started.
+      reranker:
+        condition: service_healthy
+      embedder:
+        condition: service_healthy
+    healthcheck:
+      # Aici endpoint-ul e /health, nu /api/health ca la celelalte doua —
+      # convenție diferită în repo-ul colegei, nu greșeală de transcriere.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # --------------------------------------------------------------- tracing --
+  # Colector + UI de tracing: 16686 = UI, 4318 = OTLP/HTTP
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    container_name: akadion-jaeger
+    restart: unless-stopped
+    ports:
+      - "16686:16686"
+      - "4318:4318"
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      # DECIZIE: am adaugat TZ, singurul serviciu care nu-l avea in niciunul din
+      # cele doua fisiere. Altfel timestamp-urile din UI-ul Jaeger sunt in UTC,
+      # decalate fata de log-urile tuturor celorlalte containere.
+      TZ: Europe/Bucharest
+    # DECIZIE: nimeni nu declara `depends_on: jaeger`, desi patru servicii
+    # exporta catre el. Exportul OTLP esueaza necritic (SDK-ul face retry si
+    # arunca span-urile), deci o dependenta ar cupla pornirea aplicatiei de
+    # observabilitate degeaba. Consecinta acceptata: span-urile emise in
+    # primele secunde, inainte ca Jaeger sa asculte, se pierd.
+
+volumes:
+  postgres_data:
+  minio_data:
+  qdrant_data:
+  hf_cache:
+
+# DECIZIE: fara sectiune `networks:` deloc.
+# Compose creeaza automat reteaua `default` a proiectului si baga toate
+# serviciile in ea. Asta inlocuieste, dintr-o data: `akadion_shared` (external,
+# creata de mana), `rag_network` (bridge, doar pentru cele 5 servicii RAG) si
+# toate listele `networks:` de la serviciile individuale.
+#
+# DE VERIFICAT: numele retelei devine <nume-proiect>_default, unde numele de
+# proiect vine din numele directorului (aici ar fi `draft`) sau din `-p`.
+# Comanda de diagnostic din README-ul orchestrarii
+# (`docker network inspect rag_rag_network`) nu mai e valabila — foloseste
+# `docker network inspect $(docker compose ps -q | head -1)` sau `-p akadion`
+# la pornire, ca sa ai un nume stabil.
