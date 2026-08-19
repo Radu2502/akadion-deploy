@@ -1,0 +1,141 @@
+services:
+
+  postgres:
+    image: postgres:16
+    container_name: akadion-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: akadion
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-secret}
+      TZ: Europe/Bucharest
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  minio:
+    image: minio/minio:RELEASE.2025-06-13T11-33-47Z
+    container_name: akadion-minio
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-MinioParola123!}
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    networks:
+      - default
+      - akadion_shared
+
+  # Creeaza bucket-ul o singura data si iese. `docker compose ps` il va arata
+  # Exited (0) — e normal, nu e un serviciu care ramane pornit.
+  minio-setup:
+    image: minio/mc:latest
+    container_name: akadion-minio-setup
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc alias set myminio http://minio:9000 $${MINIO_ROOT_USER:-minioadmin} $${MINIO_ROOT_PASSWORD:-MinioParola123!}) do echo '...astept minio...' && sleep 1; done;
+      /usr/bin/mc mb myminio/course-documents --ignore-existing;
+      "
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:latest
+    container_name: akadion-keycloak
+    restart: unless-stopped
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/akadion
+      KC_DB_USERNAME: myuser
+      KC_DB_PASSWORD: ${DB_PASSWORD:-secret}
+      TZ: Europe/Bucharest
+    command: start-dev --import-realm --hostname=http://keycloak:8080 --hostname-strict=false
+    ports:
+      - "8080:8080"
+    volumes:
+      # Realm-ul Akadion + utilizatorii lui. Importul se face doar la prima
+      # pornire, cat timp baza e goala; dupa aceea fisierele sunt ignorate.
+      - ./keycloak-import:/opt/keycloak/data/import
+      - ./keycloak-theme/university-theme:/opt/keycloak/themes/university-theme
+    depends_on:
+      - postgres
+
+  backend:
+    build:
+      # symlink -> ../services/akadion-backend/akadion
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: akadion-backend
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      # Doua URL-uri diferite pentru Keycloak, intentionat: browserul il vede
+      # pe localhost:8080, backend-ul din container il vede pe keycloak:8080.
+      APP_KEYCLOAK_BASE_URL: http://keycloak:8080
+      APP_KEYCLOAK_BROWSER_BASE_URL: http://keycloak:8080
+      APP_KEYCLOAK_REALM: Akadion
+      KEYCLOAK_AUTHORIZATION_URI: http://keycloak:8080/realms/Akadion/protocol/openid-connect/auth
+      KEYCLOAK_TOKEN_URI: http://keycloak:8080/realms/Akadion/protocol/openid-connect/token
+      KEYCLOAK_JWK_SET_URI: http://keycloak:8080/realms/Akadion/protocol/openid-connect/certs
+      KEYCLOAK_USER_INFO_URI: http://keycloak:8080/realms/Akadion/protocol/openid-connect/userinfo
+      KEYCLOAK_ISSUER_URI: http://keycloak:8080/realms/Akadion
+      KEYCLOAK_BACKEND_LOGIN_SECRET: ${KEYCLOAK_BACKEND_LOGIN_SECRET:-CXjLqtrWOxFIqujnPSHXmr8BssiFBqNH5L5t4UPUoT3b6mnli3hzH3E7HWo5AF8UJyKGf7ULfEGzbzdpd3eP5A}
+      KEYCLOAK_ADMIN_API_SECRET: ${KEYCLOAK_ADMIN_API_SECRET:-qkFpqAaDSjl4E9jcHgBe6kFJw0yRwpxWVs6waB1pitVQOboDQodvmbLbnt2pItjxHBeBwbVcVUddreumBT7BHf}
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/akadion
+      DB_PASSWORD: ${DB_PASSWORD:-secret}
+      APP_FRONTEND_BASE_URL: http://localhost:5173
+      MINIO_URL: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-MinioParola123!}
+      # Serviciile RAG stau in celalalt compose (orchestration/). Pe reteaua
+      # partajata DNS-ul rezolva container_name, nu numele serviciului.
+      RAG_BASE_URL: ${RAG_BASE_URL:-http://akadion-llm-response:8000}
+      RAG_EMBEDDER_URL: ${RAG_EMBEDDER_URL:-http://akadion-embedder:8001}
+      RAG_SERVICE_USERNAME: ${RAG_SERVICE_USERNAME:-akadion-spring-backend}
+      RAG_SERVICE_PASSWORD: ${RAG_SERVICE_PASSWORD:-parola_spring_rag}
+      TZ: Europe/Bucharest
+      # Idem: jaeger-ul e in orchestration/, ajungem la el prin container_name.
+      OTEL_SERVICE_NAME: akadion-backend
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://akadion-jaeger:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
+      OTEL_INSTRUMENTATION_LOGBACK_MDC_ENABLED: "true"
+    depends_on:
+      - postgres
+      - keycloak
+      - minio
+    networks:
+      - default
+      - akadion_shared
+
+  frontend:
+    build:
+      # symlink -> ../services/FRONTEND---Akadion
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: akadion-frontend
+    restart: unless-stopped
+    ports:
+      # nginx asculta pe 80 in container; nginx.conf face proxy la backend:8081
+      - "5173:80"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  minio_data:
+
+networks:
+  # Creata manual: docker network create akadion_shared
+  akadion_shared:
+    external: true
