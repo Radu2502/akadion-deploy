@@ -3,3 +3,6 @@
 .idea/
 .claude/
 services/
+.devcontainer/
+*.log
+.DS_Store
