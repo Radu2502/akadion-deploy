@@ -291,3 +291,25 @@ akadion-deploy/
 │   └── clean-test-data.sh  curăță doar ce are prefixul [TEST]
 └── services/               clonele serviciilor (gitignorate, create de `./akadion up`)
 ```
+
+## Windows 11
+
+Toate comenzile se rulează din **Git Bash**, nu din PowerShell.
+
+1. **Docker Desktop** — la instalare bifează backend-ul WSL2 (implicit).
+2. **Git for Windows** — aduce Git Bash.
+3. **Fișierul hosts** — deschide Notepad **ca administrator**, apoi
+   `C:\Windows\System32\drivers\etc\hosts`, și adaugă la final:
+
+       127.0.0.1 keycloak
+
+4. **Memorie** — creează `C:\Users\<nume>\.wslconfig`:
+
+       [wsl2]
+       memory=10GB
+
+   apoi în PowerShell: `wsl --shutdown`, și repornește Docker Desktop.
+
+> Netestat pe Windows. Dacă vă blocați undeva, spuneți-mi și ajustez.
+
+Restul pașilor sunt identici.
