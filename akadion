@@ -1,0 +1,375 @@
+#!/usr/bin/env bash
+#
+# akadion — pornire, verificare și oprire pentru stiva Akadion.
+#
+#   ./akadion up      verifică precondițiile, clonează serviciile, pornește tot
+#   ./akadion check   sondează fiecare serviciu și afișează un tabel OK/FAIL
+#   ./akadion seed    rulează scripts/seed-test-data.sh
+#   ./akadion down    oprește containerele, PĂSTRÂND datele
+#
+# Se oprește la prima eroare, cu explicație și cu comanda de reparat.
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+cd "$ROOT"
+
+# ─── Ieșire ────────────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+  C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'
+  C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+else
+  C_OK=''; C_WARN=''; C_ERR=''; C_DIM=''; C_OFF=''
+fi
+
+info() { printf '%s\n' "  $*"; }
+step() { printf '%s\n' "${C_DIM}··${C_OFF} $*"; }
+ok()   { printf '%s\n' "${C_OK}OK${C_OFF} $*"; }
+warn() { printf '%s\n' "${C_WARN}!!${C_OFF} $*" >&2; }
+die()  { printf '\n%s\n' "${C_ERR}EROARE${C_OFF} $1" >&2; shift; local l; for l in "$@"; do printf '%s\n' "        $l" >&2; done; printf '\n' >&2; exit 1; }
+
+# ─── Repo-urile de serviciu ────────────────────────────────────────────────
+# director|url|branch
+#
+# Directorul NU e numele repo-ului: `context:` din docker-compose.yaml cere
+# services/backend, services/frontend, services/embedder, services/reranker,
+# services/llm-response. Numele reale ale repo-urilor diferă de toate cinci,
+# deci clonăm explicit în directorul cerut de compose.
+#
+# URL-urile și branch-urile sunt cele ale clonelor de lucru existente
+# (git remote get-url origin / git rev-parse --abbrev-ref HEAD).
+# Sunt adrese SSH: ai nevoie de o cheie SSH înregistrată pe GitHub.
+REPOS=(
+  "backend|git@github.com:Anelisgh/akadion-backend.git|main"
+  "frontend|git@github.com:RaduMatei04/FRONTEND---Akadion.git|main"
+  "embedder|git@github.com:teodoratirca13/embedder_service.git|main"
+  "reranker|git@github.com:Radu2502/reranker-service.git|refactor/structura-app"
+  "llm-response|git@github.com:Steefyy/RAG_llm_response_service_Stefi.git|fix/logging-reranker"
+)
+
+# Contextele de build așteptate de docker-compose.yaml, verificate după clonare.
+# cale-relativă|dockerfile-din-context
+CONTEXTS=(
+  "services/backend/akadion|Dockerfile"
+  "services/frontend|Dockerfile"
+  "services/embedder|Dockerfile.multistage"
+  "services/reranker|docker/Dockerfile.multistage"
+  "services/llm-response|docker/Dockerfile.multistage"
+)
+
+# ─── Serviciile sondate de `check` ─────────────────────────────────────────
+# nume|url|regex-obligatoriu-în-corp (gol = e destul codul 200)
+#
+# Endpoint-urile vin din cod / din docker-compose.yaml:
+#   backend      /actuator/health e singurul actuator lăsat permitAll în
+#                SecurityConfig.java:80 (restul API-ului cere sesiune).
+#   embedder     /api/health răspunde 200 și când e "degraded" (model neîncărcat
+#                sau Qdrant picat), de-aia verificăm și conținutul — exact ca
+#                healthcheck-ul din compose.
+#   reranker     /api/health, lăsat în afara basic auth.
+#   llm-response /health (nu /api/health — convenție diferită în repo).
+#   keycloak     realmul Akadion, importat din infra/keycloak-import.
+#   frontend     nginx servește index.html pe 80, publicat pe 5173.
+# TODO: /minio/health/live și /healthz (qdrant) sunt luate din healthcheck-urile
+# COMENTATE din docker-compose.yaml — nu le-am putut confirma cu Docker pornit.
+# Dacă apar FAIL pe MinIO sau Qdrant cu restul stivei sănătoasă, verifică întâi
+# adresele astea două.
+HTTP_CHECKS=(
+  "keycloak|http://localhost:8080/realms/Akadion|"
+  "backend|http://localhost:8081/actuator/health|"
+  "frontend|http://localhost:5173/|"
+  "embedder|http://localhost:8001/api/health|\"status\":[[:space:]]*\"ok\""
+  "reranker|http://localhost:8002/api/health|"
+  "llm-response|http://localhost:8000/health|"
+  "qdrant|http://localhost:6333/healthz|"
+  "minio|http://localhost:9000/minio/health/live|"
+  "jaeger|http://localhost:16686/|"
+)
+
+CHECK_TIMEOUT="${AKADION_CHECK_TIMEOUT:-5}"
+
+# ═══════════════════════════════════════════════════════════ precondiții ═══
+
+need_docker() {
+  command -v docker >/dev/null 2>&1 \
+    || die "Docker nu e instalat (comanda \`docker\` lipsește)." \
+           "Instalează Docker Desktop sau docker-ce, apoi reia."
+
+  docker compose version >/dev/null 2>&1 \
+    || die "Nu găsesc pluginul \`docker compose\` (v2)." \
+           "Ai probabil doar \`docker-compose\` (v1), care nu suportă sintaxa din" \
+           "docker-compose.yaml. Instalează docker-compose-plugin."
+
+  docker info >/dev/null 2>&1 \
+    || die "Daemonul Docker nu răspunde." \
+           "Pornește Docker Desktop (sau: sudo systemctl start docker) și reia."
+
+  ok "Docker disponibil ($(docker --version | sed 's/,.*//'))"
+}
+
+need_hosts() {
+  # De ce: backend-ul trimite browserul spre Keycloak pe http://keycloak:8080
+  # (APP_KEYCLOAK_BROWSER_BASE_URL din docker-compose.yaml), iar Keycloak
+  # acceptă redirect_uri doar de pe host-urile din clientul backend-login.
+  # Fără intrarea din /etc/hosts, login-ul din browser moare pe "server not
+  # found" imediat după ce apeși Login.
+  if awk '/^[[:space:]]*#/ {next}
+          $1 == "127.0.0.1" { for (i = 2; i <= NF; i++) if ($i == "keycloak") found = 1 }
+          END { exit !found }' /etc/hosts; then
+    ok "/etc/hosts are 127.0.0.1 keycloak"
+    return 0
+  fi
+
+  die "În /etc/hosts lipsește intrarea pentru Keycloak." \
+      "Fără ea, redirectul de login din browser eșuează (backend-ul trimite" \
+      "browserul spre http://keycloak:8080, nume care nu se rezolvă pe host)." \
+      "" \
+      "Adaugă exact linia:" \
+      "    127.0.0.1 keycloak" \
+      "" \
+      "de exemplu cu:" \
+      "    echo '127.0.0.1 keycloak' | sudo tee -a /etc/hosts"
+}
+
+need_env() {
+  [[ -f .env ]] \
+    || die "Lipsește fișierul .env din $ROOT." \
+           "Copiază șablonul și completează cheia Gemini:" \
+           "    cp .env.example .env" \
+           "Cheia se ia de la https://aistudio.google.com/apikey"
+
+  # Citim valoarea fără să executăm fișierul (poate conține caractere ciudate
+  # în parole). Ultima definiție câștigă, ca la docker compose.
+  local val
+  val=$(grep -E '^[[:space:]]*GEMINI_API_KEY=' .env | tail -1 | cut -d= -f2- || true)
+  val=${val%\"}; val=${val#\"}; val=${val%\'}; val=${val#\'}
+  val=$(printf '%s' "$val" | tr -d '[:space:]')
+
+  [[ -n $val ]] \
+    || die "GEMINI_API_KEY e gol în .env." \
+           "Fără cheie, containerele pornesc, dar embedder-ul crapă la primul PDF" \
+           "cu imagini, iar llm-response nu poate genera niciun răspuns." \
+           "Ia o cheie de la https://aistudio.google.com/apikey și pune-o în .env:" \
+           "    GEMINI_API_KEY=..."
+
+  ok ".env prezent, GEMINI_API_KEY completat"
+}
+
+clone_repos() {
+  local entry dir url branch missing=0 current
+
+  for entry in "${REPOS[@]}"; do
+    IFS='|' read -r dir url branch <<<"$entry"
+
+    if [[ -d services/$dir/.git ]]; then
+      current=$(git -C "services/$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')
+      if [[ $current != "$branch" ]]; then
+        warn "services/${dir} e pe branch-ul '${current}', nu '${branch}' — îl las așa, dar build-ul poate diferi."
+      fi
+      continue
+    fi
+
+    if [[ -e services/$dir ]]; then
+      die "services/${dir} există dar nu e un repo git." \
+          "Mută-l sau șterge-l, ca să pot clona ${url} acolo."
+    fi
+
+    if (( missing == 0 )); then
+      command -v git >/dev/null 2>&1 || die "git lipsește, nu pot clona serviciile."
+      missing=1
+    fi
+
+    step "clonez ${url} (${branch}) -> services/${dir}"
+    git clone --branch "$branch" "$url" "services/$dir" \
+      || die "Clonarea lui ${url} a eșuat." \
+             "Cel mai probabil nu ai acces SSH la GitHub. Verifică cu:" \
+             "    ssh -T git@github.com" \
+             "Dacă folosești HTTPS în loc de SSH, clonează manual în services/${dir}."
+  done
+
+  (( missing == 0 )) && ok "cele ${#REPOS[@]} repo-uri de serviciu sunt deja în services/"
+  return 0
+}
+
+check_contexts() {
+  local entry ctx dockerfile
+  for entry in "${CONTEXTS[@]}"; do
+    IFS='|' read -r ctx dockerfile <<<"$entry"
+    [[ -d $ctx ]] \
+      || die "Contextul de build ${ctx} nu există." \
+             "docker-compose.yaml îl cere exact sub numele ăsta. Dacă ai clonat" \
+             "manual repo-ul cu numele lui original, redenumește directorul."
+    [[ -f $ctx/$dockerfile ]] \
+      || die "Lipsește ${ctx}/${dockerfile}." \
+             "Probabil branch-ul clonat nu e cel așteptat (vezi lista REPOS din" \
+             "scriptul ăsta) sau layout-ul repo-ului s-a schimbat."
+  done
+  ok "contextele de build și Dockerfile-urile sunt la locul lor"
+}
+
+# ═════════════════════════════════════════════════════════════ comenzi ═════
+
+cmd_up() {
+  printf '\n%s\n\n' "Akadion — pornire"
+
+  step "Precondiții"
+  need_docker
+  need_hosts
+  need_env
+
+  printf '\n'; step "Servicii"
+  clone_repos
+  check_contexts
+
+  printf '\n'; step "docker compose up -d --build"
+  info "prima rulare durează 15-25 min (Maven, npm, modelul de reranking)"
+  printf '\n'
+  docker compose up -d --build \
+    || die "\`docker compose up\` a eșuat." \
+           "Vezi mesajul de mai sus. Pentru log-urile unui serviciu anume:" \
+           "    docker compose logs -f <serviciu>"
+
+  printf '\n'
+  ok "containerele au pornit"
+  info "embedder-ul mai descarcă modelul BAAI/bge-m3 (~2 GB) la prima pornire —"
+  info "poate dura câteva minute până devine sănătos."
+  info ""
+  info "verifică starea cu:   ./akadion check"
+  info "interfața:            http://localhost:5173"
+  info "tracing (Jaeger):     http://localhost:16686"
+}
+
+# http_probe <url> <regex-corp> -> setează _code, _detail; întoarce 0 la OK
+_code=''; _detail=''
+http_probe() {
+  local url=$1 want=$2 tmp
+  tmp=$(mktemp)
+  _detail=''
+  _code=$(curl -s -o "$tmp" -w '%{http_code}' --max-time "$CHECK_TIMEOUT" "$url" 2>/dev/null) || _code='000'
+
+  if [[ $_code == 000 ]]; then
+    _detail='fără răspuns (container oprit?)'
+    rm -f "$tmp"; return 1
+  fi
+  if [[ $_code != 2* ]]; then
+    _detail="HTTP ${_code}"
+    rm -f "$tmp"; return 1
+  fi
+  if [[ -n $want ]] && ! grep -Eq "$want" "$tmp"; then
+    _detail="HTTP 200 dar corpul nu confirmă (degraded?)"
+    rm -f "$tmp"; return 1
+  fi
+  _detail="HTTP ${_code}"
+  rm -f "$tmp"; return 0
+}
+
+# row <nume> <adresă> <OK|FAIL> <detalii>
+# Culorile nu se pot lăsa în seama lui printf '%-6s': secvențele ANSI intră în
+# numărătoarea lățimii și strâmbă coloanele. Deci colorăm și aliniem separat.
+row() {
+  local name=$1 url=$2 state=$3 detail=$4 colored pad
+  if [[ $state == OK ]]; then colored="${C_OK}OK${C_OFF}"; else colored="${C_ERR}FAIL${C_OFF}"; fi
+  pad=$(printf '%*s' $(( 6 - ${#state} )) '')
+  printf '%-14s %-44s %s%s%s\n' "$name" "$url" "$colored" "$pad" "$detail"
+}
+
+cmd_check() {
+  command -v curl >/dev/null 2>&1 || die "curl lipsește — nu pot sonda serviciile."
+
+  printf '\n%s\n\n' "Akadion — verificare servicii"
+  printf '%-14s %-44s %-6s %s\n' 'SERVICIU' 'ADRESĂ' 'STARE' 'DETALII'
+  printf '%s\n' "$(printf '─%.0s' {1..96})"
+
+  local failed=0 entry name url want
+
+  for entry in "${HTTP_CHECKS[@]}"; do
+    IFS='|' read -r name url want <<<"$entry"
+    if http_probe "$url" "$want"; then
+      row "$name" "$url" OK "$_detail"
+    else
+      row "$name" "$url" FAIL "$_detail"; failed=$(( failed + 1 ))
+    fi
+  done
+
+  # Postgres nu vorbește HTTP — pg_isready, din imaginea oficială.
+  if docker exec akadion-postgres pg_isready -U myuser -d akadion >/dev/null 2>&1; then
+    row 'postgres' 'docker exec pg_isready' OK 'acceptă conexiuni'
+  else
+    row 'postgres' 'docker exec pg_isready' FAIL 'nu acceptă conexiuni'
+    failed=$(( failed + 1 ))
+  fi
+
+  # minio-setup e one-shot: creează bucket-ul și iese. Exited(0) = corect.
+  local mc_state mc_exit
+  mc_state=$(docker inspect -f '{{.State.Status}}' akadion-minio-setup 2>/dev/null || echo 'lipsă')
+  mc_exit=$(docker inspect -f '{{.State.ExitCode}}' akadion-minio-setup 2>/dev/null || echo '-')
+  if [[ $mc_state == exited && $mc_exit == 0 ]]; then
+    row 'minio-setup' 'one-shot (bucket course-documents)' OK 'Exited (0)'
+  else
+    row 'minio-setup' 'one-shot (bucket course-documents)' FAIL "${mc_state} (exit ${mc_exit})"
+    failed=$(( failed + 1 ))
+  fi
+
+  printf '\n'
+  if (( failed == 0 )); then
+    ok "toate cele 11 servicii răspund"
+    return 0
+  fi
+  warn "${failed} serviciu/servicii nu răspund."
+  info "log-uri:        docker compose logs -f <serviciu>"
+  info "stare completă: docker compose ps"
+  info "la prima pornire embedder-ul poate sta câteva minute pe descărcarea modelului."
+  return 1
+}
+
+cmd_seed() {
+  local s="scripts/seed-test-data.sh"
+  [[ -x $s ]] || die "Nu găsesc ${s} executabil în $ROOT." \
+                     "Verifică drepturile:  chmod +x ${s}"
+  command -v jq >/dev/null 2>&1 \
+    || die "jq lipsește — seed-ul îl folosește pentru a citi răspunsurile API." \
+           "Instalează-l (ex: sudo apt install jq) și reia."
+  exec "$s" "$@"
+}
+
+cmd_down() {
+  need_docker
+  printf '\n'; step "docker compose stop"
+  # Intenționat `stop`, nu `down`: `down` ar șterge containerele, iar cu
+  # `-v` și volumele (postgres_data, minio_data, qdrant_data, hf_cache) —
+  # adică realmul Keycloak, documentele și modelul de 2 GB descărcat.
+  docker compose stop
+  printf '\n'
+  ok "containerele sunt oprite; datele și modelele rămân pe disc"
+  info "repornire (fără rebuild):  docker compose start   sau   ./akadion up"
+}
+
+usage() {
+  cat <<'EOF'
+
+akadion — stiva Akadion pe o singură mașină
+
+  ./akadion up      verifică precondițiile, clonează serviciile lipsă din
+                    services/ și pornește tot (docker compose up -d --build)
+  ./akadion check   sondează fiecare serviciu și afișează un tabel OK/FAIL
+  ./akadion seed    populează aplicația cu date de test
+                    (scripts/seed-test-data.sh)
+  ./akadion down    oprește containerele, păstrând datele și modelele
+
+EOF
+}
+
+main() {
+  local cmd=${1:-}
+  [[ $# -gt 0 ]] && shift || true
+  case $cmd in
+    up)    cmd_up "$@" ;;
+    check) cmd_check "$@" ;;
+    seed)  cmd_seed "$@" ;;
+    down)  cmd_down "$@" ;;
+    ''|-h|--help|help) usage ;;
+    *)     usage; die "Subcomandă necunoscută: ${cmd}" ;;
+  esac
+}
+
+main "$@"
