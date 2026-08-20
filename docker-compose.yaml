@@ -2,7 +2,7 @@
 # Akadion — compose consolidat (DRAFT, nevalidat cu docker)
 #
 # Sursa: infra/docker-compose.yaml (Keycloak, postgres, MinIO, backend, frontend)
-#      + ../orchestration/docker-compose.yaml (qdrant, embedder, reranker,
+#      + ./orchestration/docker-compose.yaml (qdrant, embedder, reranker,
 #        llm-response, jaeger)
 #
 # Nu am rulat `docker compose config` — nu exista Docker in container.
@@ -27,7 +27,7 @@
 #   akadion-embedder` sa functioneze la fel ca inainte.
 #
 # DECIZIE: cai de build relative la ACEST fisier (draft/).
-#   Deci `../infra/...` pentru backend/frontend si `../../orchestration/...`
+#   Deci `./infra/...` pentru backend/frontend si `././orchestration/...`
 #   pentru serviciile RAG. Daca muti fisierul in infra/ sau in radacina
 #   repo-ului, TOATE `context:`-urile de mai jos trebuie rescrise. Contextele
 #   RAG ies din repo-ul akadion-deploy — legal pentru docker, dar inseamna ca
@@ -36,20 +36,20 @@
 # -----------------------------------------------------------------------------
 # SYMLINK-URI RUPTE in infra/ — nu le-am reparat, doar le documentez.
 #
-#   infra/backend  -> ../services/akadion-backend/akadion   (RUPT)
-#   infra/frontend -> ../services/FRONTEND---Akadion        (RUPT)
+#   infra/backend  -> ./services/akadion-backend/akadion   (RUPT)
+#   infra/frontend -> ./services/FRONTEND---Akadion        (RUPT)
 #
 #   De ce sunt rupte: tinta e relativa la infra/, deci se rezolva la
 #   akadion-deploy/services/... — director care nu exista. Clonele reale sunt
 #   cu un nivel mai sus, in /IdeaProjects/akadion-pycharm/services/.
-#   Acelasi symlink din ../infra/ (copia din afara repo-ului) se rezolva corect,
+#   Acelasi symlink din ./infra/ (copia din afara repo-ului) se rezolva corect,
 #   fiindca acolo e la adancimea potrivita. Symlink-urile au fost copiate
 #   textual intr-un repo mai adanc, fara rescrierea caii.
 #
 #   Cum ar trebui inlocuite (o singura varianta, la alegere, pe host):
-#     a) rescrie tinta cu inca un nivel de ../ :
-#          ln -sfn ../../services/akadion-backend/akadion infra/backend
-#          ln -sfn ../../services/FRONTEND---Akadion      infra/frontend
+#     a) rescrie tinta cu inca un nivel de ./ :
+#          ln -sfn ././services/akadion-backend/akadion infra/backend
+#          ln -sfn ././services/FRONTEND---Akadion      infra/frontend
 #        Cel mai mic efort, dar repo-ul ramane nefunctional pe alta masina.
 #     b) scoate symlink-urile din repo si pune caile absolute/relative direct in
 #        `context:` (varianta din draftul asta e echivalenta cu (a)).
@@ -219,8 +219,8 @@ services:
     volumes:
       # Realm-ul Akadion + utilizatorii lui. Importul se face doar la prima
       # pornire, cat timp baza e goala; dupa aceea fisierele sunt ignorate.
-      - ../infra/keycloak-import:/opt/keycloak/data/import
-      - ../infra/keycloak-theme/university-theme:/opt/keycloak/themes/university-theme
+      - ./infra/keycloak-import:/opt/keycloak/data/import
+      - ./infra/keycloak-theme/university-theme:/opt/keycloak/themes/university-theme
     depends_on:
       # DECIZIE: am inlocuit `- postgres` cu service_healthy. Keycloak ruleaza
       # migrarile de schema la pornire si pica daca postgres inca initializeaza
@@ -245,8 +245,8 @@ services:
       # DE VERIFICAT: symlink rupt, vezi blocul SYMLINK-URI din antetul
       # fisierului. Calea de mai jos merge doar dupa ce infra/backend e refacut.
       # Alternativa directa, care sare peste symlink:
-      #   context: ../../services/akadion-backend/akadion
-      context: ../services/backend/akadion
+      #   context: ././services/akadion-backend/akadion
+      context: ./services/backend/akadion
       dockerfile: Dockerfile
     container_name: akadion-backend
     restart: unless-stopped
@@ -323,8 +323,8 @@ services:
   frontend:
     build:
       # DE VERIFICAT: acelasi symlink rupt. Alternativa fara symlink:
-      #   context: ../../services/FRONTEND---Akadion
-      context: ../services/frontend
+      #   context: ././services/FRONTEND---Akadion
+      context: ./services/frontend
       dockerfile: Dockerfile
     container_name: akadion-frontend
     restart: unless-stopped
@@ -346,7 +346,7 @@ services:
   # ------------------------------------------------------------------ RAG ----
   embedder:
     build:
-      context: ../services/embedder
+      context: ./services/embedder
       dockerfile: Dockerfile.multistage
     container_name: akadion-embedder
     restart: unless-stopped
@@ -412,7 +412,7 @@ services:
 
   reranker:
     build:
-      context: ../services/reranker
+      context: ./services/reranker
       # Dockerfile-urile s-au mutat în docker/ (repo-ul reranker-service)
       dockerfile: docker/Dockerfile.multistage
     container_name: akadion-reranker
@@ -451,7 +451,7 @@ services:
 
   llm-response:
     build:
-      context: ../services/llm-response
+      context: ./services/llm-response
       # Idem reranker: reorganizarea de layout a mutat Dockerfile-urile în docker/
       dockerfile: docker/Dockerfile.multistage
     container_name: akadion-llm-response
