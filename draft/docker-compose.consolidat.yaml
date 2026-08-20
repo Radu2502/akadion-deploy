@@ -246,7 +246,7 @@ services:
       # fisierului. Calea de mai jos merge doar dupa ce infra/backend e refacut.
       # Alternativa directa, care sare peste symlink:
       #   context: ../../services/akadion-backend/akadion
-      context: ../infra/backend
+      context: ../services/backend/akadion
       dockerfile: Dockerfile
     container_name: akadion-backend
     restart: unless-stopped
@@ -324,7 +324,7 @@ services:
     build:
       # DE VERIFICAT: acelasi symlink rupt. Alternativa fara symlink:
       #   context: ../../services/FRONTEND---Akadion
-      context: ../infra/frontend
+      context: ../services/frontend
       dockerfile: Dockerfile
     container_name: akadion-frontend
     restart: unless-stopped
@@ -346,7 +346,7 @@ services:
   # ------------------------------------------------------------------ RAG ----
   embedder:
     build:
-      context: ../../orchestration/embedder
+      context: ../services/embedder
       dockerfile: Dockerfile.multistage
     container_name: akadion-embedder
     restart: unless-stopped
@@ -412,7 +412,7 @@ services:
 
   reranker:
     build:
-      context: ../../orchestration/reranker
+      context: ../services/reranker
       # Dockerfile-urile s-au mutat în docker/ (repo-ul reranker-service)
       dockerfile: docker/Dockerfile.multistage
     container_name: akadion-reranker
@@ -451,7 +451,7 @@ services:
 
   llm-response:
     build:
-      context: ../../orchestration/llm-response
+      context: ../services/llm-response
       # Idem reranker: reorganizarea de layout a mutat Dockerfile-urile în docker/
       dockerfile: docker/Dockerfile.multistage
     container_name: akadion-llm-response
