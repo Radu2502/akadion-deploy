@@ -278,6 +278,53 @@ sync_repos() {
 }
 
 
+# warn_behind_repos — spune doar dacă vreo clonă a rămas în urmă față de origin.
+#
+# De ce în `up`: `up` cheamă clone_repos(), care clonează exclusiv ce lipsește.
+# O clonă veche trece complet neobservată și construiești imagini din cod
+# vechi — frontend-ul a fost la un moment dat cu 3 commit-uri în urmă, iar
+# `up` ar fi pornit vechea interfață fără niciun semn.
+#
+# Doar raportează: nu atinge nimic în services/, ca `up` să rămână non-mutant.
+# `git fetch` scrie doar ref-urile de urmărire (origin/*), nu arborele de
+# lucru și nu branch-ul tău.
+#
+# Ce trece în tăcere, intenționat:
+#   - repo neclonat sau pe alt branch — clone_repos() le semnalează deja;
+#   - fetch eșuat — poți fi offline, iar `up` trebuie să meargă mai departe
+#     cu ce ai pe disc, nu să se oprească din cauza unei verificări opționale.
+warn_behind_repos() {
+  local entry dir url branch current behind
+  local behind_list=()
+
+  command -v git >/dev/null 2>&1 || return 0
+
+  for entry in "${REPOS[@]}"; do
+    IFS='|' read -r dir url branch <<<"$entry"
+
+    [[ -d services/$dir/.git ]] || continue
+
+    current=$(git -C "services/$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')
+    [[ $current == "$branch" ]] || continue
+
+    git -C "services/$dir" fetch --quiet origin "$branch" 2>/dev/null || continue
+
+    behind=$(git -C "services/$dir" rev-list --count "HEAD..origin/${branch}" 2>/dev/null || echo 0)
+    if (( behind > 0 )); then
+      behind_list+=("${dir}|${branch}|${behind}")
+    fi
+  done
+
+  (( ${#behind_list[@]} > 0 )) || return 0
+
+  for entry in "${behind_list[@]}"; do
+    IFS='|' read -r dir branch behind <<<"$entry"
+    warn "services/${dir} e în urmă cu $(plural "$behind" "1 commit" "${behind} commit-uri") față de origin/${branch}."
+  done
+  warn "    construiesc din codul de pe disc; pentru cel mai nou:  ./akadion sync"
+  return 0
+}
+
 check_contexts() {
   local entry ctx dockerfile
   for entry in "${CONTEXTS[@]}"; do
@@ -306,6 +353,7 @@ cmd_up() {
 
   printf '\n'; step "Servicii"
   clone_repos
+  warn_behind_repos
   check_contexts
 
   printf '\n'; step "docker compose up -d --build"
