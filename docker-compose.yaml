@@ -286,6 +286,14 @@ services:
       RAG_EMBEDDER_URL: ${RAG_EMBEDDER_URL:-http://embedder:8001}
       RAG_SERVICE_USERNAME: ${RAG_SERVICE_USERNAME:-akadion-spring-backend}
       RAG_SERVICE_PASSWORD: ${RAG_SERVICE_PASSWORD:-parola_spring_rag}
+      # Credentialele callback-ului de status imagini, primit DE LA embedder
+      # (PATCH /api/rag/documents/image-status). Aceleasi valori ca in blocul
+      # embedder de mai jos: acolo sunt cele cu care trimite, aici cele cu care
+      # verifica. Fara ele, RagCallbackController le vede goale si respinge
+      # fiecare callback cu "app.rag.callback.username/password nu sunt
+      # configurate", iar statusul imaginilor ramane blocat.
+      SPRING_BOOT_CALLBACK_USERNAME: ${SPRING_BOOT_CALLBACK_USERNAME:-akadion-embedder-callback}
+      SPRING_BOOT_CALLBACK_PASSWORD: ${SPRING_BOOT_CALLBACK_PASSWORD:-parola_callback_imagini}
       TZ: Europe/Bucharest
       OTEL_SERVICE_NAME: akadion-backend
       # Idem: era http://akadion-jaeger:4318, acum numele de serviciu.
@@ -371,6 +379,11 @@ services:
       MINIO_BUCKET: course-documents
       RAG_SERVICE_USERNAME: ${RAG_SERVICE_USERNAME:-akadion-spring-backend}
       RAG_SERVICE_PASSWORD: ${RAG_SERVICE_PASSWORD:-parola_spring_rag}
+      # Nivelul de log chiar se aplica de la commit-ul 686a218 din embedder_service
+      # (inainte, setup_logger avea "INFO" cablat in semnatura si LOG_LEVEL nu
+      # avea niciun efect). Acelasi ${LOG_LEVEL} ca la llm-response, ca sa se
+      # regleze dintr-un singur loc in .env.
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
       TZ: Europe/Bucharest
       GEMINI_API_KEY: ${GEMINI_API_KEY}
       GEMINI_VISION_MODEL: ${GEMINI_VISION_MODEL:-gemini-3.1-flash-lite}
