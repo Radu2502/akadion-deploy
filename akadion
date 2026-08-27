@@ -15,6 +15,20 @@ set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$ROOT"
 
+# ─── Proiectul compose ─────────────────────────────────────────────────────
+# Fără asta, `docker compose` deduce numele proiectului din directorul curent
+# (akadion-deploy). Într-un terminal nou, unde variabila nu e exportată, asta
+# înseamnă un stack complet separat de cel pornit înainte — iar fiindcă
+# docker-compose.yaml fixează `container_name:` pentru fiecare serviciu,
+# pornirea moare cu „container name already in use", lăsând în urmă volume,
+# rețea și imagini orfane ale proiectului nou.
+#
+# Exportat, nu doar setat: se moștenește în `docker compose` și în orice
+# subproces pornit de script, deci up / sync / check / seed / down lucrează
+# toate pe același proiect, indiferent din ce shell le rulezi.
+# Cine vrea alt nume îl dă din mediu:  COMPOSE_PROJECT_NAME=altceva ./akadion up
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-akadion}"
+
 # ─── Ieșire ────────────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
   C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'

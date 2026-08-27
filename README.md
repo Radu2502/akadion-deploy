@@ -289,6 +289,15 @@ docker compose down -v
 * **Dacă schimbi `MINIO_ROOT_PASSWORD` în `.env`**, containerul `minio-setup`
   rămâne pe parola implicită (nu primește `environment:`) și crearea bucket-ului
   eșuează. Documentat în `docker-compose.yaml`, la serviciul respectiv.
+* **`container name already in use` la pornire** → ai rulat `docker compose`
+  direct, dintr-un shell fără `COMPOSE_PROJECT_NAME`. Compose deduce atunci
+  numele proiectului din directorul curent (`akadion-deploy`) și încearcă un
+  stack paralel peste containerele existente, care au `container_name:` fix.
+  `./akadion` exportă singur `COMPOSE_PROJECT_NAME=akadion`, deci dă comenzile
+  prin el. Pentru `docker compose` pe mână, adaugă `-p akadion`. Un proiect
+  paralel creat din greșeală se curăță cu
+  `docker compose -p akadion-deploy down -v` — atenție, `-v` îi șterge
+  volumele (ale proiectului orfan, nu ale celui bun).
 * **`./akadion up` moare la clonare, cu „Remote branch ... not found"** →
   branch-ul din `REPOS` a fost șters după merge. Suprascrie-l cu
   `AKADION_BRANCH_<serviciu>` (pasul 2.2b).
