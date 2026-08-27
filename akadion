@@ -145,9 +145,7 @@ need_env() {
   # Citim valoarea fără să executăm fișierul (poate conține caractere ciudate
   # în parole). Ultima definiție câștigă, ca la docker compose.
   local val
-  val=$(grep -E '^[[:space:]]*GEMINI_API_KEY=' .env | tail -1 | cut -d= -f2- || true)
-  val=${val%\"}; val=${val#\"}; val=${val%\'}; val=${val#\'}
-  val=$(printf '%s' "$val" | tr -d '[:space:]')
+  val=$(dotenv_value GEMINI_API_KEY)
 
   [[ -n $val ]] \
     || die "GEMINI_API_KEY e gol în .env." \
@@ -157,6 +155,46 @@ need_env() {
            "    GEMINI_API_KEY=..."
 
   ok ".env prezent, GEMINI_API_KEY completat"
+}
+
+# dotenv_value <cheie> — valoarea unei chei din .env, fără să execute fișierul
+# (parolele pot conține caractere pe care shell-ul le-ar interpreta). Ultima
+# definiție câștigă, ca la docker compose. Gol dacă .env sau cheia lipsesc.
+dotenv_value() {
+  local key=$1 val
+  [[ -f .env ]] || return 0
+  val=$(grep -E "^[[:space:]]*${key}=" .env | tail -1 | cut -d= -f2- || true)
+  val=${val%\"}; val=${val#\"}; val=${val%\'}; val=${val#\'}
+  printf '%s' "$val" | tr -d '[:space:]'
+}
+
+# apply_branch_overrides — branch-ul din REPOS e doar valoarea implicită.
+#
+# De ce: reranker și llm-response stau pe branch-uri de lucru
+# (refactor/structura-app, fix/logging-reranker). În ziua în care PR-ul se
+# merge-uiește și branch-ul se șterge, `git clone --branch` eșuează pentru
+# orice clonare curată, iar `up` moare la primul pas — fără nicio scăpare, în
+# afară de editarea scriptului. Cu override, muți serviciul pe main dintr-o
+# linie în .env.
+#
+# Numele variabilei: AKADION_BRANCH_ + numele directorului, cu `-` înlocuit de
+# `_`, fiindcă bash nu acceptă cratimă în nume de variabilă:
+#     reranker      ->  AKADION_BRANCH_reranker
+#     llm-response  ->  AKADION_BRANCH_llm_response
+#
+# Precedență, ca la docker compose: variabila din mediu bate .env, iar .env
+# bate valoarea din REPOS.
+apply_branch_overrides() {
+  local i dir url branch var override
+  for i in "${!REPOS[@]}"; do
+    IFS='|' read -r dir url branch <<<"${REPOS[$i]}"
+    var="AKADION_BRANCH_${dir//-/_}"
+    override=${!var:-}
+    [[ -n $override ]] || override=$(dotenv_value "$var")
+    [[ -n $override && $override != "$branch" ]] || continue
+    REPOS[$i]="${dir}|${url}|${override}"
+    step "${dir}: branch ${override} (implicit ${branch}, suprascris prin ${var})"
+  done
 }
 
 clone_repos() {
@@ -352,6 +390,7 @@ cmd_up() {
   need_env
 
   printf '\n'; step "Servicii"
+  apply_branch_overrides
   clone_repos
   warn_behind_repos
   check_contexts
@@ -481,6 +520,7 @@ cmd_down() {
 
 cmd_sync() {
   printf '\n%s\n\n' "Akadion — sincronizare services/"
+  apply_branch_overrides
   sync_repos
   printf '\n'
   info "dacă s-a schimbat cod, repornește cu rebuild:  ./akadion up"

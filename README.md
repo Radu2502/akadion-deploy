@@ -61,6 +61,34 @@ valoare implicită; restul merg ca atare pentru o instalare de dezvoltare
 Fără cheie, containerele pornesc oricum — dar embedder-ul crapă la primul PDF
 cu imagini, iar llm-response nu poate genera niciun răspuns.
 
+### 2.2b. (Opțional) Branch-uri de serviciu
+
+`./akadion` ține în tabelul `REPOS` branch-ul fiecărui serviciu. Două dintre ele
+sunt branch-uri de lucru — `reranker` pe `refactor/structura-app`,
+`llm-response` pe `fix/logging-reranker`. Când PR-ul se merge-uiește și
+branch-ul se șterge, `git clone --branch` eșuează și `./akadion up` moare la
+primul pas.
+
+Poți suprascrie branch-ul per serviciu, din `.env` sau din mediu, fără să
+editezi scriptul:
+
+```bash
+# în .env
+AKADION_BRANCH_reranker=main
+AKADION_BRANCH_llm_response=main
+
+# sau doar pentru o rulare
+AKADION_BRANCH_reranker=main ./akadion up
+```
+
+Numele variabilei e `AKADION_BRANCH_` + numele directorului din `services/`, cu
+`-` înlocuit de `_` (bash nu acceptă cratimă în nume de variabilă): directorul
+`services/llm-response` → `AKADION_BRANCH_llm_response`.
+
+Se aplică la clonare și la `./akadion sync`. Un repo **deja** clonat nu e mutat
+automat — `up` și `sync` te avertizează că e pe alt branch și îl sar; ca să-l
+muți, fă tu `git checkout` sau șterge directorul și lasă `up` să-l reclonzeze.
+
 ### 2.3. Adaugă Keycloak în `/etc/hosts`
 
 ```bash
@@ -261,6 +289,12 @@ docker compose down -v
 * **Dacă schimbi `MINIO_ROOT_PASSWORD` în `.env`**, containerul `minio-setup`
   rămâne pe parola implicită (nu primește `environment:`) și crearea bucket-ului
   eșuează. Documentat în `docker-compose.yaml`, la serviciul respectiv.
+* **`./akadion up` moare la clonare, cu „Remote branch ... not found"** →
+  branch-ul din `REPOS` a fost șters după merge. Suprascrie-l cu
+  `AKADION_BRANCH_<serviciu>` (pasul 2.2b).
+* **Serviciile sunt în urmă față de origin** → `./akadion up` te avertizează
+  și îți spune cu câte commit-uri; `./akadion sync` le aduce la zi prin
+  fast-forward, fără să atingă modificările tale locale.
 * **Login-ul pică în browser** → aproape sigur lipsește `127.0.0.1 keycloak` din
   `/etc/hosts` (pasul 2.3).
 * **Răspunsuri fără reranking, fără eroare vizibilă** → credențialele
@@ -279,7 +313,7 @@ docker compose down -v
 
 ```
 akadion-deploy/
-├── akadion                 script-ul de mai sus (up / check / seed / down)
+├── akadion                 script-ul de mai sus (up / sync / check / seed / down)
 ├── docker-compose.yaml     toate cele 11 servicii, cu deciziile comentate
 ├── .env.example            șablonul de configurare
 ├── infra/
