@@ -3,6 +3,7 @@
 # akadion — pornire, verificare și oprire pentru stiva Akadion.
 #
 #   ./akadion up      verifică precondițiile, clonează serviciile, pornește tot
+#   ./akadion sync    aduce clonele din services/ la zi cu origin (fast-forward)
 #   ./akadion check   sondează fiecare serviciu și afișează un tabel OK/FAIL
 #   ./akadion seed    rulează scripts/seed-test-data.sh
 #   ./akadion down    oprește containerele, PĂSTRÂND datele
@@ -26,6 +27,9 @@ info() { printf '%s\n' "  $*"; }
 step() { printf '%s\n' "${C_DIM}··${C_OFF} $*"; }
 ok()   { printf '%s\n' "${C_OK}OK${C_OFF} $*"; }
 warn() { printf '%s\n' "${C_WARN}!!${C_OFF} $*" >&2; }
+# "1 commit" / "3 commit-uri" — ca mesajele lui sync_repos sa nu sune strambe.
+plural() { (( $1 == 1 )) && printf '%s' "$2" || printf '%s' "$3"; }
+
 die()  { printf '\n%s\n' "${C_ERR}EROARE${C_OFF} $1" >&2; shift; local l; for l in "$@"; do printf '%s\n' "        $l" >&2; done; printf '\n' >&2; exit 1; }
 
 # ─── Repo-urile de serviciu ────────────────────────────────────────────────
@@ -191,6 +195,89 @@ clone_repos() {
   return 0
 }
 
+# sync_repos — aduce clonele din services/ la zi cu origin, fără să piardă nimic.
+#
+# De ce fast-forward și nu `reset --hard`: în services/ stau repo-urile
+# colegilor, clonate pentru context. Un reset ar arunca tăcut orice ai avea
+# local. Aici, orice repo care nu poate avansa curat e sărit cu un avertisment
+# și rămâne exact cum era — tu decizi manual ce faci cu el.
+#
+# Nu e apelat din `up`: `up` doar clonează ce lipsește, ca să nu-ți schimbe
+# codul sub picioare la fiecare pornire. Sincronizarea e o decizie explicită.
+sync_repos() {
+  local entry dir url branch current behind ahead changed=0 skipped=0
+
+  command -v git >/dev/null 2>&1 || die "git lipsește, nu pot sincroniza serviciile."
+
+  for entry in "${REPOS[@]}"; do
+    IFS='|' read -r dir url branch <<<"$entry"
+
+    if [[ ! -d services/$dir/.git ]]; then
+      warn "services/${dir} nu e clonat — rulează \`./akadion up\` întâi."
+      skipped=$((skipped + 1)); continue
+    fi
+
+    current=$(git -C "services/$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')
+    if [[ $current != "$branch" ]]; then
+      warn "services/${dir} e pe branch-ul '${current}', nu '${branch}' — îl sar."
+      skipped=$((skipped + 1)); continue
+    fi
+
+    # Modificări necomise: git ar accepta un fast-forward peste ele, dar le-aș
+    # amesteca cu ce vine din origin. Mai bine te anunț și nu ating nimic.
+    if ! git -C "services/$dir" diff --quiet \
+       || ! git -C "services/$dir" diff --cached --quiet; then
+      warn "services/${dir} are modificări necomise — îl sar, nu ating nimic."
+      skipped=$((skipped + 1)); continue
+    fi
+
+    step "fetch ${dir} (origin/${branch})"
+    if ! git -C "services/$dir" fetch --quiet origin "$branch" 2>/dev/null; then
+      warn "fetch a eșuat pentru services/${dir} — verifică rețeaua sau accesul SSH:"
+      warn "    ssh -T git@github.com"
+      skipped=$((skipped + 1)); continue
+    fi
+
+    behind=$(git -C "services/$dir" rev-list --count "HEAD..origin/${branch}")
+    ahead=$(git -C "services/$dir" rev-list --count "origin/${branch}..HEAD")
+
+    if (( behind == 0 )); then
+      if (( ahead > 0 )); then
+        info "${dir}: la zi ($(plural "$ahead" "1 commit local nepublicat" "${ahead} commit-uri locale nepublicate"))"
+      else
+        info "${dir}: la zi"
+      fi
+      continue
+    fi
+
+    if (( ahead > 0 )); then
+      warn "services/${dir} a divergat: ${ahead} local, ${behind} pe origin."
+      warn "    rezolvă manual:  git -C services/${dir} rebase origin/${branch}"
+      skipped=$((skipped + 1)); continue
+    fi
+
+    # --ff-only: dacă n-ar fi o simplă avansare, git refuză și nu lasă repo-ul
+    # în conflict. Refuză și când un fișier neurmărit de-al tău ar fi
+    # suprascris de unul nou din origin — exact comportamentul dorit aici.
+    if git -C "services/$dir" merge --ff-only --quiet "origin/${branch}"; then
+      ok "${dir}: avansat cu $(plural "$behind" "1 commit" "${behind} commit-uri")"
+      changed=$((changed + 1))
+    else
+      warn "services/${dir} n-a putut avansa (fișiere neurmărite în cale?) — îl sar."
+      skipped=$((skipped + 1))
+    fi
+  done
+
+  printf '\n'
+  if (( skipped > 0 )); then
+    info "$(plural "$changed" "1 repo avansat" "${changed} repo-uri avansate"), ${skipped} sărite (vezi avertismentele de mai sus)"
+  else
+    ok "cele ${#REPOS[@]} repo-uri de serviciu sunt la zi"
+  fi
+  return 0
+}
+
+
 check_contexts() {
   local entry ctx dockerfile
   for entry in "${CONTEXTS[@]}"; do
@@ -344,6 +431,13 @@ cmd_down() {
   info "repornire (fără rebuild):  docker compose start   sau   ./akadion up"
 }
 
+cmd_sync() {
+  printf '\n%s\n\n' "Akadion — sincronizare services/"
+  sync_repos
+  printf '\n'
+  info "dacă s-a schimbat cod, repornește cu rebuild:  ./akadion up"
+}
+
 usage() {
   cat <<'EOF'
 
@@ -351,6 +445,8 @@ akadion — stiva Akadion pe o singură mașină
 
   ./akadion up      verifică precondițiile, clonează serviciile lipsă din
                     services/ și pornește tot (docker compose up -d --build)
+  ./akadion sync    aduce clonele din services/ la zi cu origin, doar prin
+                    fast-forward; sare peste ce e murdar sau divergat
   ./akadion check   sondează fiecare serviciu și afișează un tabel OK/FAIL
   ./akadion seed    populează aplicația cu date de test
                     (scripts/seed-test-data.sh)
@@ -364,6 +460,7 @@ main() {
   [[ $# -gt 0 ]] && shift || true
   case $cmd in
     up)    cmd_up "$@" ;;
+    sync)  cmd_sync "$@" ;;
     check) cmd_check "$@" ;;
     seed)  cmd_seed "$@" ;;
     down)  cmd_down "$@" ;;
