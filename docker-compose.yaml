@@ -552,6 +552,144 @@ services:
     # observabilitate degeaba. Consecinta acceptata: span-urile emise in
     # primele secunde, inainte ca Jaeger sa asculte, se pierd.
 
+  # ═══ MOD DEV: hot reload ═══════════════════════════════════════════════════
+  # Profilul `dev` nu porneste la `./akadion up` normal. Serviciile de aici
+  # inlocuiesc omoloagele lor (aceleasi porturi), deci se ruleaza ori-ori:
+  #   docker compose stop reranker
+  #   docker compose --profile dev up -d reranker-dev
+  #
+  # DECIZIE: montez doar directorul de sursa, nu tot repo-ul. Un bind mount
+  # peste /app ar ascunde .venv-ul construit in imagine.
+  # DECIZIE: pastrez `opentelemetry-instrument` in comanda — altfel modul dev
+  # ar pierde tracing-ul, adica exact ce vreau sa observ in timp ce lucrez.
+  # DE STIUT: `extends` NU mosteneste depends_on (exclus prin specificatie),
+  # deci serviciile -dev pornesc fara sa astepte qdrant / jaeger / embedder.
+
+  reranker-dev:
+    profiles: ["dev"]
+    build:
+      context: ./services/reranker
+      dockerfile: docker/Dockerfile.multistage
+    container_name: akadion-reranker-dev
+    restart: unless-stopped
+    command: ["opentelemetry-instrument", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8002", "--reload", "--reload-dir", "/app/app"]
+    ports:
+      - "8002:8002"
+    # ALIAS: llm-response apeleaza http://reranker:8002. Fara alias, numele
+    # `reranker` nu se rezolva cand ruleaza doar varianta -dev.
+    networks:
+      default:
+        aliases: [reranker]
+    environment:
+      SERVICE_NAME: reranker
+      LOG_FORMAT: json
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      TZ: Europe/Bucharest
+      RAG_SERVICE_USERNAME: ${RAG_SERVICE_USERNAME:-akadion-spring-backend}
+      RAG_SERVICE_PASSWORD: ${RAG_SERVICE_PASSWORD:-parola_spring_rag}
+      OTEL_SERVICE_NAME: reranker
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
+    volumes:
+      - ./services/reranker/app:/app/app:ro
+
+  embedder-dev:
+    profiles: ["dev"]
+    build:
+      context: ./services/embedder
+      dockerfile: Dockerfile.multistage
+    container_name: akadion-embedder-dev
+    restart: unless-stopped
+    command: ["opentelemetry-instrument", "uvicorn", "fastapi_app.main:app", "--host", "0.0.0.0", "--port", "8001", "--reload", "--reload-dir", "/app/fastapi_app"]
+    ports:
+      - "8001:8001"
+    networks:
+      default:
+        aliases: [embedder]
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-MinioParola123!}
+      MINIO_BUCKET: course-documents
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      GEMINI_VISION_MODEL: ${GEMINI_VISION_MODEL:-gemini-3.1-flash-lite}
+      GEMINI_REQUEST_DELAY_SECONDS: "13.0"
+      MAX_IMAGES_PER_DOCUMENT: "20"
+      MIN_IMAGE_WIDTH: "100"
+      MIN_IMAGE_HEIGHT: "100"
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      TZ: Europe/Bucharest
+      RAG_SERVICE_USERNAME: ${RAG_SERVICE_USERNAME:-akadion-spring-backend}
+      RAG_SERVICE_PASSWORD: ${RAG_SERVICE_PASSWORD:-parola_spring_rag}
+      SPRING_BOOT_CALLBACK_URL: ${SPRING_BOOT_CALLBACK_URL:-http://backend:8081/api/rag/documents/image-status}
+      SPRING_BOOT_CALLBACK_USERNAME: ${SPRING_BOOT_CALLBACK_USERNAME:-akadion-embedder-callback}
+      SPRING_BOOT_CALLBACK_PASSWORD: ${SPRING_BOOT_CALLBACK_PASSWORD:-parola_callback_imagini}
+      OTEL_SERVICE_NAME: embedder
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+      - ./services/embedder/fastapi_app:/app/fastapi_app:ro
+
+  llm-response-dev:
+    profiles: ["dev"]
+    build:
+      context: ./services/llm-response
+      dockerfile: docker/Dockerfile.multistage
+    container_name: akadion-llm-response-dev
+    restart: unless-stopped
+    command: ["opentelemetry-instrument", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/app/app"]
+    ports:
+      - "8000:8000"
+    networks:
+      default:
+        aliases: [llm-response]
+    environment:
+      RERANKER_URL: http://reranker:8002/api/rerank/chunks
+      EMBEDDER_URL: http://embedder:8001/api/query/embed
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: "6333"
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-course_chunks}
+      USE_QDRANT_MOCK: "false"
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.1-flash-lite}
+      RAG_SERVICE_USERNAME: ${RAG_SERVICE_USERNAME:-akadion-spring-backend}
+      RAG_SERVICE_PASSWORD: ${RAG_SERVICE_PASSWORD:-parola_spring_rag}
+      LOG_FORMAT: json
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SERVICE_NAME: llm-response
+      TZ: Europe/Bucharest
+      OTEL_SERVICE_NAME: llm-response
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
+    volumes:
+      - ./services/llm-response/app:/app/app:ro
+
+  # network_mode: host — vite.config.js (repo-ul lui Matei) are proxy hardcodat
+  # pe http://localhost:8081. Cu reteaua host, `localhost` inseamna masina,
+  # unde backend-ul e publicat pe 8081, deci proxy-ul merge nemodificat.
+  frontend-dev:
+    profiles: ["dev"]
+    image: node:20-alpine
+    container_name: akadion-frontend-dev
+    working_dir: /app
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
+    network_mode: host
+    volumes:
+      - ./services/frontend:/app
+      - /app/node_modules
+
+
 volumes:
   postgres_data:
   minio_data:
