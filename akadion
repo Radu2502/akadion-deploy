@@ -451,6 +451,19 @@ http_probe() {
   rm -f "$tmp"; return 0
 }
 
+# http_probe_retry <url> <regex-corp> -> ca http_probe, dar reîncearcă.
+# Motiv: `up` întoarce când containerele au pornit, nu când aplicațiile sunt
+# gata. Serviciile de care nu depinde nimic prin service_healthy sunt
+# raportate `Started` imediat, deci prima sondă poate cădea în gol.
+http_probe_retry() {
+  local i
+  for i in 1 2 3; do
+    http_probe "$1" "$2" && return 0
+    [[ $i -lt 3 ]] && sleep 5
+  done
+  return 1
+}
+
 # row <nume> <adresă> <OK|FAIL> <detalii>
 # Culorile nu se pot lăsa în seama lui printf '%-6s': secvențele ANSI intră în
 # numărătoarea lățimii și strâmbă coloanele. Deci colorăm și aliniem separat.
@@ -472,7 +485,7 @@ cmd_check() {
 
   for entry in "${HTTP_CHECKS[@]}"; do
     IFS='|' read -r name url want <<<"$entry"
-    if http_probe "$url" "$want"; then
+    if http_probe_retry "$url" "$want"; then
       row "$name" "$url" OK "$_detail"
     else
       row "$name" "$url" FAIL "$_detail"; failed=$(( failed + 1 ))
